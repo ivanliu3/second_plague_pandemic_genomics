@@ -100,3 +100,24 @@ The demo generates:
 
 The demo completed in 3.85  seconds on a standard macOS desktop using Python 3.12. It is expected to complete in less than 1 minute on a normal desktop computer and requires no specialised hardware.
 
+## 4. Instructions for use
+
+This repository contains study-specific analysis scripts rather than a single standalone software package. The scripts are organised by analysis type under the `scripts/` directory.
+
+To apply the scripts to new data, users should:
+
+1. install the required software and R or Python dependencies;
+2. prepare input files in the formats expected by the relevant script;
+3. update file paths and analysis parameters where necessary;
+4. run the script using the command-line options or examples provided in the script documentation.
+
+The main analysis directories are:
+
+- `scripts/selectionScan/`: genome-wide association analyses, meta-analyses, and LocusZoom plots
+- `scripts/power/`: statistical power simulations for the selection scans
+- `scripts/mahalanobisD/`: PCA-based Mahalanobis-distance analyses
+- `scripts/ibd/`: IBD-fragment calling, filtering, and summarisation
+- `scripts/ancestry_classification/`: ancestry classification using Mahalanobis distances and IBD sharing
+- `scripts/plotting/`: generation of the main manuscript figures
+
+Some scripts contain file paths and parameters specific to the original high-performance computing environment. Users should replace these with paths and settings appropriate to their own data and computing environment.
