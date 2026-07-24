@@ -1,0 +1,48 @@
+SCHEME  STDERR
+# Tracking Allele Frequencies
+# AVERAGEFREQ ON
+# MINMAXFREQ ON
+CUSTOMVARIABLE TotalSampleSize
+LABEL TotalSampleSize as n_ind
+
+# LOAD INPUT FILES
+
+# Enable Genomic control correction
+# GENOMICCONTROL ON
+
+# VERBOSE ON
+
+# === DESCRIBE AND PROCESS THE FIRST INPUT FILE ===
+MARKER rs
+# ALLELE   EFFECT_ALLELE NON_EFFECT_ALLELE
+ALLELE allele1 allele0
+# FREQ     EFFECT_ALLELE_FREQ
+FREQ af
+EFFECT beta
+STDERR se
+PVALUE p_score
+WEIGHT n_ind 
+PROCESS /maps/projects/ilab/people/pls394/plague/Association_modern/GEMMA_output/2026Feb20/meta_analysis_all/Lund.pre_vs_present.mm.7_pcs.forMETAL.txt
+
+
+# === DESCRIBE AND PROCESS THE SECOND INPUT FILE ===
+MARKER rs
+# ALLELE   EFFECT_ALLELE NON_EFFECT_ALLELE
+ALLELE allele1 allele0
+# FREQ     EFFECT_ALLELE_FREQ
+FREQ af
+EFFECT beta
+STDERR se
+PVALUE p_score
+WEIGHT n_ind 
+PROCESS /maps/projects/ilab/people/pls394/plague/Association_modern/GEMMA_output/2026Feb20/meta_analysis_all/Trondheim.pre_vs_present.mm.7_pcs.forMETAL.txt
+
+
+#for the final meta-analysis of all 8 samples only output results if the
+#combined weight is greater than 10000 people
+
+OUTFILE /projects/ilab/people/pls394/plague/Association_modern/GEMMA_output/2026Feb20/meta_analysis_all/GEMMA_preVSmodern_Lund-Trondheim.PC7.all .InverseVariancetbl
+MINWEIGHT 100
+ANALYZE 
+
+QUIT

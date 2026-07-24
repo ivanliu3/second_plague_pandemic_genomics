@@ -1,0 +1,880 @@
+library(fields)
+library(parallel)
+
+############################################################
+## 1. Make allele-frequency grid
+############################################################
+
+make.p.grid <- function(ngrid, af.min = 1e-4) {
+  seq(af.min, 1 - af.min, length.out = ngrid + 1)
+}
+
+############################################################
+## 2. Power for one pair of allele frequencies
+############################################################
+
+compute.genotype.power.one <- function(n.pre,
+                                       n.post,
+                                       p.pre,
+                                       p.post,
+                                       sig = 1.1e-8,
+                                       nsim = 10000,
+                                       min.maf = 0.05) {
+  
+  combined.af <- (n.pre * p.pre + n.post * p.post) /
+    (n.pre + n.post)
+  
+  combined.maf <- min(combined.af, 1 - combined.af)
+  
+  if (combined.maf < min.maf) {
+    return(NA_real_)
+  }
+  
+  pvals <- replicate(nsim, {
+    
+    g.pre <- rbinom(n.pre, size = 2, prob = p.pre)
+    g.post <- rbinom(n.post, size = 2, prob = p.post)
+    
+    genotype <- c(g.pre, g.post)
+    cohort <- c(rep(0, n.pre), rep(1, n.post))
+    
+    ## fit <- lm(genotype ~ cohort)
+    ## summary(fit)$coefficients["cohort", "Pr(>|t|)"]
+    ##fit = glm(cohort ~ genotype, family = binomial)
+    ##summary(fit)$coefficients["genotype", "Pr(>|z|)"]
+    fit <- lm(cohort ~ genotype)
+    summary(fit)$coefficients["genotype", "Pr(>|t|)"]
+
+  })
+  
+  mean(pvals < sig)
+}
+
+############################################################
+## 3. Multiple-core power grid
+############################################################
+
+compute.genotype.power.grid.mc <- function(n.pre,
+                                           n.post,
+                                           sig = 1.1e-8,
+                                           ngrid = 200,
+                                           min.maf = 0.05,
+                                           af.min = 1e-4,
+                                           nsim = 10000,
+                                           n.cores = max(1, detectCores() - 1),
+                                           seed = 1) {
+  
+  p.grid <- make.p.grid(
+    ngrid = ngrid,
+    af.min = af.min
+  )
+  
+  grid.df <- expand.grid(
+    post.af = p.grid,
+    pre.af = p.grid
+  )
+  
+  cl <- makeCluster(n.cores)
+  
+  on.exit(stopCluster(cl), add = TRUE)
+  
+  ## Reproducible parallel random numbers
+  clusterSetRNGStream(cl, iseed = seed)
+  
+  ## Export needed objects/functions to workers
+  clusterExport(
+    cl,
+    varlist = c(
+      "compute.genotype.power.one",
+      "n.pre",
+      "n.post",
+      "sig",
+      "min.maf",
+      "nsim"
+    ),
+    envir = environment()
+  )
+  
+  power.vec <- parLapply(
+    cl,
+    seq_len(nrow(grid.df)),
+    function(i) {
+      
+      compute.genotype.power.one(
+        n.pre = n.pre,
+        n.post = n.post,
+        p.pre = grid.df$pre.af[i],
+        p.post = grid.df$post.af[i],
+        sig = sig,
+        nsim = nsim,
+        min.maf = min.maf
+      )
+    }
+  )
+  
+  power.vec <- unlist(power.vec)
+  
+  power.mat <- matrix(
+    power.vec,
+    nrow = length(p.grid),
+    ncol = length(p.grid),
+    byrow = FALSE
+  )
+  
+  invisible(list(
+    p.grid = p.grid,
+    power.mat = power.mat,
+    grid.df = grid.df,
+    n.pre = n.pre,
+    n.post = n.post,
+    sig = sig,
+    min.maf = min.maf,
+    nsim = nsim,
+    n.cores = n.cores
+  ))
+}
+
+############################################################
+## 4. Extract minimum detectable delta AF by pre-BD AF
+############################################################
+
+extract.min.delta.by.pre.af.genotype.mc <- function(n.pre,
+                                                    n.post,
+                                                    sig = 1.1e-8,
+                                                    ngrid = 100,
+                                                    target.power = 0.8,
+                                                    min.maf = 0.05,
+                                                    af.min = 1e-4,
+                                                    nsim = 1000,
+                                                    n.cores = max(1, detectCores() - 1),
+                                                    seed = 1) {
+  
+  power.obj <- compute.genotype.power.grid.mc(
+    n.pre = n.pre,
+    n.post = n.post,
+    sig = sig,
+    ngrid = ngrid,
+    min.maf = min.maf,
+    af.min = af.min,
+    nsim = nsim,
+    n.cores = n.cores,
+    seed = seed
+  )
+  
+  p.grid <- power.obj$p.grid
+  power.mat <- power.obj$power.mat
+  
+  grid.df <- expand.grid(
+    post.af = p.grid,
+    pre.af = p.grid
+  )
+  
+  grid.df$power <- as.vector(power.mat)
+  
+  grid.df$combined.af <- with(
+    grid.df,
+    (n.pre * pre.af + n.post * post.af) / (n.pre + n.post)
+  )
+  
+  grid.df$combined.maf <- pmin(
+    grid.df$combined.af,
+    1 - grid.df$combined.af
+  )
+  
+  grid.df$delta.af <- abs(grid.df$post.af - grid.df$pre.af)
+  
+  powered.df <- grid.df[
+    !is.na(grid.df$power) &
+      grid.df$combined.maf >= min.maf &
+      grid.df$power >= target.power,
+  ]
+  
+  result <- do.call(
+    rbind,
+    lapply(p.grid, function(this.pre.af) {
+      
+      df <- powered.df[powered.df$pre.af == this.pre.af, ]
+      
+      if (nrow(df) == 0) {
+        return(data.frame(
+          pre.af = this.pre.af,
+          min.delta.af = NA_real_,
+          post.af.at.min.delta = NA_real_,
+          direction = NA_character_,
+          power = NA_real_,
+          combined.maf = NA_real_
+        ))
+      }
+      
+      df.min <- df[which.min(df$delta.af), ]
+      
+      data.frame(
+        pre.af = df.min$pre.af,
+        min.delta.af = df.min$delta.af,
+        post.af.at.min.delta = df.min$post.af,
+        direction = ifelse(
+          df.min$post.af > df.min$pre.af,
+          "increase",
+          "decrease"
+        ),
+        power = df.min$power,
+        combined.maf = df.min$combined.maf
+      )
+    })
+  )
+  
+  rownames(result) <- NULL
+  
+  invisible(list(
+    result = result,
+    power.obj = power.obj,
+    powered.df = powered.df
+  ))
+}
+
+############################################################
+## 5. Plot contour using multiple-core result
+############################################################
+
+plot.genotype.power.contour.mc <- function(n.pre,
+                                           n.post,
+                                           sig = 1.1e-8,
+                                           ngrid = 100,
+                                           target.power = 0.8,
+                                           min.maf = 0.05,
+                                           af.min = 1e-4,
+                                           nsim = 1000,
+                                           n.cores = max(1, detectCores() - 1),
+                                           seed = 1,
+                                           show.mask = TRUE) {
+  
+  power.obj <- compute.genotype.power.grid.mc(
+    n.pre = n.pre,
+    n.post = n.post,
+    sig = sig,
+    ngrid = ngrid,
+    min.maf = min.maf,
+    af.min = af.min,
+    nsim = nsim,
+    n.cores = n.cores,
+    seed = seed
+  )
+  
+  p.grid <- power.obj$p.grid
+  power.mat <- power.obj$power.mat
+  
+  mask.mat <- outer(
+    p.grid,
+    p.grid,
+    Vectorize(function(p.post, p.pre) {
+      
+      combined.af <- (n.pre * p.pre + n.post * p.post) /
+        (n.pre + n.post)
+      
+      combined.maf <- min(combined.af, 1 - combined.af)
+      
+      as.numeric(combined.maf < min.maf)
+    })
+  )
+  
+  plot(
+    NA,
+    xlim = range(p.grid),
+    ylim = range(p.grid),
+    xlab = "Present-day allele frequency",
+    ylab = "Pre-BD allele frequency",
+    main = paste0(
+      "Genotype simulation power = ", target.power,
+      ", combined MAF >= ", min.maf
+    )
+  )
+  
+  if (show.mask) {
+    image(
+      x = p.grid,
+      y = p.grid,
+      z = mask.mat,
+      add = TRUE,
+      col = c(NA, "grey85"),
+      breaks = c(-0.5, 0.5, 1.5)
+    )
+  }
+  
+  contour(
+    x = p.grid,
+    y = p.grid,
+    z = power.mat,
+    levels = target.power,
+    add = TRUE,
+    lwd = 2,
+    drawlabels = TRUE
+  )
+  
+  abline(a = 0, b = 1, lty = 2)
+  
+  invisible(list(
+    p.grid = p.grid,
+    power.mat = power.mat,
+    mask.mat = mask.mat,
+    min.maf = min.maf
+  ))
+}
+
+
+
+plot.contour.from.mc.obj <- function(mc.obj,
+                                     n.pre,
+                                     n.post,
+                                     contour.levels = c(0.5, 0.6, 0.7, 0.8, 0.9, 0.999),
+                                     min.maf = 0.05,
+                                     show.mask = TRUE,
+                                     xlab.txt = 'post-BD Allele Frequency',
+                                     ylab.txt = 'pre-BD Allele Frequency',
+                                     main.txt = 'Discovery Power: Meta pre-BD vs. post-BD') {
+
+    p.grid <- mc.obj$power.obj$p.grid
+    power.mat <- mc.obj$power.obj$power.mat
+
+    ## Combined MAF mask
+    mask.mat <- outer(
+        p.grid,
+        p.grid,
+        Vectorize(function(p.post, p.pre) {
+
+            combined.af <- (n.pre * p.pre + n.post * p.post) /
+                (n.pre + n.post)
+
+            combined.maf <- min(combined.af, 1 - combined.af)
+
+            as.numeric(combined.maf < min.maf)
+        })
+    )
+
+    plot(
+        NA,
+        xlim = range(p.grid),
+        ylim = range(p.grid),
+        xlab = xlab.txt,
+        ylab = ylab.txt,
+        main = main.txt
+    )
+
+    if (show.mask) {
+        image(
+            x = p.grid,
+            y = p.grid,
+            z = mask.mat,
+            add = TRUE,
+            col = c(NA, "dark gray"),
+            breaks = c(-0.5, 0.5, 1.5)
+        )
+    }
+
+    ## Draw all contours except 0.8 in black
+    other.levels <- setdiff(contour.levels, 0.8)
+
+    contour(
+        x = p.grid,
+        y = p.grid,
+        z = power.mat,
+        levels = other.levels,
+        add = TRUE,
+        lwd = 1.5,
+        col = "black",
+        drawlabels = TRUE
+    )
+
+    ## Highlight 0.8 power contour in red
+    if (0.8 %in% contour.levels) {
+        contour(
+            x = p.grid,
+            y = p.grid,
+            z = power.mat,
+            levels = 0.8,
+            add = TRUE,
+            lwd = 1.5,
+            col = "red",
+            drawlabels = TRUE
+        )
+    }
+
+    abline(a = 0, b = 1, lty = 2)
+
+    invisible(list(
+        p.grid = p.grid,
+        power.mat = power.mat,
+        mask.mat = mask.mat
+    ))
+}
+
+############################################################
+## 6. Helper function
+############################################################
+
+ceiling_dec <- function(x, digits = 2) {
+  ceiling(x * 10^digits) / 10^digits
+}
+
+############################################################
+## 7.1 Example: Pre-BD vs present-day meta-analysis
+############################################################
+
+## A. preVSpresent: Meta
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 218 + 95,
+  n.post = 380 + 1182,
+  #n.post = 30+75,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 1583425
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_present_meta_genotype.rds"
+)
+
+min.delta.pre_present.meta.genotype <- mc.obj$result
+min.delta.pre_present.meta.genotype[
+  c(
+    which.max(min.delta.pre_present.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_present.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_present.meta <- range(
+  min.delta.pre_present.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_present.meta, digits = 2)
+
+
+
+## B. pre_post: Meta
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 218 + 95,
+  #n.post = 380 + 1182,
+  n.post = 30+75,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 452456
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_pre_post_meta_genotype.rds"
+)
+
+min.delta.pre_post.meta.genotype <- mc.obj$result
+
+
+min.delta.pre_post.meta.genotype[
+  c(
+    which.max(min.delta.pre_post.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_post.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_post.meta <- range(
+  min.delta.pre_post.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_post.meta, digits = 2)
+
+
+power.obj <- mc.obj$power.obj
+## pdf("pre_post_meta_genotype_power_contour.500grid.10000sim.pdf", width = 7, height = 7)
+## plot.contour.from.mc.obj(
+##     mc.obj = mc.obj,
+##     n.pre = 218 + 95,
+##     n.post = 30 + 75,
+##     target.power = 0.8,
+##     min.maf = 0.05,
+##     show.mask = TRUE
+## )
+## dev.off()
+
+
+## pdf("pre_post_trondheim_genotype_power_contour.200grid.10000sim.pdf", width = 7, height = 7)
+## plot.contour.from.mc.obj(
+##     mc.obj = mc.obj,
+##     n.pre = 95,
+##     n.post = 30,
+##     target.power = 0.8,
+##     min.maf = 0.05,
+##     show.mask = TRUE
+## )
+## dev.off()
+
+
+
+## C. pre_present: Lund
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 218,
+  #n.post = 380 + 1182,
+  n.post = 380,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 452456
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_present_lund_genotype.rds"
+)
+
+min.delta.pre_post.meta.genotype <- mc.obj$result
+
+
+min.delta.pre_post.meta.genotype[
+  c(
+    which.max(min.delta.pre_post.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_post.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_post.meta <- range(
+  min.delta.pre_post.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_post.meta, digits = 2)
+
+
+power.obj <- mc.obj$power.obj
+pdf("pre_post_meta_genotype_power_contour.500grid.10000sim.pdf", width = 7, height = 7)
+plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 + 95,
+    n.post = 30 + 75,
+    target.power = 0.8,
+    min.maf = 0.05,
+    show.mask = TRUE
+)
+dev.off()
+
+## D. pre_present: Trondheim
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 95,
+  #n.post = 380 + 1182,
+  n.post = 1182,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 5823023
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_present_trondheim_genotype.200grid_10000sim.rds"
+)
+
+min.delta.pre_post.meta.genotype <- mc.obj$result
+min.delta.pre_post.meta.genotype[
+  c(
+    which.max(min.delta.pre_post.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_post.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_post.meta <- range(
+  min.delta.pre_post.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_post.meta, digits = 2)
+
+
+power.obj <- mc.obj$power.obj
+pdf("pre_post_meta_genotype_power_contour.500grid.10000sim.pdf", width = 7, height = 7)
+plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 + 95,
+    n.post = 30 + 75,
+    target.power = 0.8,
+    min.maf = 0.05,
+    show.mask = TRUE
+)
+dev.off()
+
+## E. pre_post: Lund
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 218,
+  #n.post = 380 + 1182,
+  n.post = 75,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 5823023
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_post_lund_genotype.200grid_10000sim.rds"
+)
+
+min.delta.pre_post.meta.genotype <- mc.obj$result
+min.delta.pre_post.meta.genotype[
+  c(
+    which.max(min.delta.pre_post.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_post.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_post.meta <- range(
+  min.delta.pre_post.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_post.meta, digits = 2)
+
+
+power.obj <- mc.obj$power.obj
+## pdf("pre_post_meta_genotype_power_contour.500grid.10000sim.pdf", width = 7, height = 7)
+## plot.contour.from.mc.obj(
+##     mc.obj = mc.obj,
+##     n.pre = 218 + 95,
+##     n.post = 30 + 75,
+##     target.power = 0.8,
+##     min.maf = 0.05,
+##     show.mask = TRUE
+## )
+## dev.off()
+
+
+## F. pre_post: Trondheim
+mc.obj <- extract.min.delta.by.pre.af.genotype.mc(
+  n.pre = 95,
+  #n.post = 380 + 1182,
+  n.post = 30,
+  sig = 1.1e-8,
+  ngrid = 200,
+  target.power = 0.8,
+  min.maf = 0.05,
+  af.min = 0,
+  nsim = 10000,
+  n.cores = 100,
+  seed = 5823023
+)
+
+saveRDS(
+    mc.obj,
+    file = "mc_pre_post_trondheim_genotype.200grid_10000sim.rds"
+)
+
+min.delta.pre_post.meta.genotype <- mc.obj$result
+min.delta.pre_post.meta.genotype[
+  c(
+    which.max(min.delta.pre_post.meta.genotype$min.delta.af),
+    which.min(min.delta.pre_post.meta.genotype$min.delta.af)
+  ),
+]
+
+range.min.delta.pre_post.meta <- range(
+  min.delta.pre_post.meta.genotype$min.delta.af,
+  na.rm = TRUE
+)
+
+ceiling_dec(range.min.delta.pre_post.meta, digits = 2)
+
+
+power.obj <- mc.obj$power.obj
+## pdf("pre_post_meta_genotype_power_contour.500grid.10000sim.pdf", width = 7, height = 7)
+## plot.contour.from.mc.obj(
+##     mc.obj = mc.obj,
+##     n.pre = 218 + 95,
+##     n.post = 30 + 75,
+##     target.power = 0.8,
+##     min.maf = 0.05,
+##     show.mask = TRUE
+## )
+## dev.off()
+
+######################
+## make contour plots
+######################
+pdf("FigS13_contour_discovery.pdf", width = 8, height = 11) 
+par(mfrow = c(3, 2), mar = c(5, 5, 4, 2))
+
+## meta:pre vs post
+mc.obj <- readRDS("mc_pre_post_meta_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.meta.pre_post = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 + 95,
+    n.post = 30 + 75,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "post-BD allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Meta pre-BD vs. post-BD"
+)
+
+## meta:pre vs present
+mc.obj <- readRDS("mc_pre_present_meta_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.meta.pre_present = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 + 95,
+    n.post = 380 + 1182,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "present-day allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Meta pre-BD vs. present-day"
+)
+
+## lund:pre vs post
+mc.obj <- readRDS("mc_pre_post_lund_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.lund.pre_post = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 ,
+    n.post = 30 ,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "post-BD allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Lund pre-BD vs. post-BD"
+)
+
+## lund:pre vs present
+mc.obj <- readRDS("mc_pre_present_lund_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.lund.pre_present = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 218 ,
+    n.post = 380 ,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "present-day allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Lund pre-BD vs. present-day"
+)
+
+## trondheim:pre vs post
+mc.obj <- readRDS("mc_pre_post_trondheim_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.trond.pre_post = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 95,
+    n.post = 30,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "post-BD allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Trondheim pre-BD vs. post-BD"
+)
+
+## trondheim:pre vs present-day
+mc.obj <- readRDS("mc_pre_present_trondheim_genotype.200grid_10000sim.rds")
+power.obj <-mc.obj$power.obj
+p.trond.pre_present = plot.contour.from.mc.obj(
+    mc.obj = mc.obj,
+    n.pre = 95 ,
+    n.post = 1182 ,
+    min.maf = 0.05,
+    show.mask = TRUE,
+    xlab.txt = "present-day allele frequency",
+    ylab.txt = "pre-BD allele frequency",
+    main.txt = "Discovery Power: Trondheim pre-BD vs. present-day"
+)
+
+dev.off()
+
+
+###################### 
+## calculate power
+######################
+p1 =0.136
+p2=0.057
+
+p1=0.158
+p2=0.070
+
+p1=0.136
+p2=0.230
+
+p1=0.629
+p2=0.473
+
+p1=0.107
+p2=0.050
+
+p1=0.158
+p2=0.070
+
+p1=0.151
+p2=0.088
+
+p1=0.443
+p2=0.710
+
+p1=0.554
+p2=0.276
+
+p1=0.136
+p2=0.057
+
+p1=0.136
+p2=0.230
+set.seed(240404)
+power.meta <- compute.genotype.power.one(
+    n.pre = 218 + 95,
+    n.post = 75 + 30,
+    p.pre = p1,
+    p.post = p2,
+    sig = 0.05,
+    nsim = 10000,
+    min.maf = 0.05
+)
+power.meta
+
+set.seed(34934)
+power.lund <- compute.genotype.power.one(
+    n.pre = 218 ,
+    n.post = 75 ,
+    p.pre = p1,
+    p.post = p2,
+    sig = 0.05,
+    nsim = 10000,
+    min.maf = 0.05
+)
+power.lund
+
+set.seed(693)
+power.trond <- compute.genotype.power.one(
+    n.pre =95, 
+    n.post = 30, 
+    p.pre = p1,
+    p.post = p2,
+    sig = 0.05,
+    nsim = 10000,
+    min.maf = 0.05
+)
+power.trond
