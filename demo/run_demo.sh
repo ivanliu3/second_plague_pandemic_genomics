@@ -3,7 +3,7 @@
 set -eo pipefail
 
 DEMO_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="${DEMO_DIR}/../mahalanobisD/pcaDistCalc.mahalanobis.py"
+SCRIPT="${DEMO_DIR}/../scripts/mahalanobisD/pcaDistCalc.mahalanobis.py"
 
 cd "${DEMO_DIR}"
 
